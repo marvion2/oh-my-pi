@@ -145,6 +145,29 @@ def _run_pre_publish_bun_fix(bindings: ToolBindings, args: Mapping[str, Any], *,
     if not _has_bun_script(bindings.workspace.repo_dir, "fix"):
         return
     repo_dir = str(bindings.workspace.repo_dir)
+    # Dirty-tree gate BEFORE the formatter so any pre-existing uncommitted
+    # edit isn't silently swept into the `style: bun run fix` commit by the
+    # `git add -A` below. The agent owns the worktree end-to-end; any diff
+    # not already in a commit is a workflow bug it must resolve before we
+    # mutate the tree further.
+    pre_status = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=normal"],
+        cwd=repo_dir,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if pre_status.stdout.strip():
+        dirty = "\n  ".join(pre_status.stdout.strip().splitlines())
+        msg = (
+            f"refusing to {stage}: dirty worktree before `bun run fix`.\n  "
+            f"{dirty}\n"
+            "Commit (or `git stash`) every change before invoking the formatter — "
+            "anything left uncommitted would be folded into the `style: bun run fix` "
+            "commit and silently land in the PR."
+        )
+        _audit(bindings, tool_name, args, error=msg)
+        _raise_command(msg)
     try:
         proc = subprocess.run(
             _PRE_PR_FIX_COMMAND,

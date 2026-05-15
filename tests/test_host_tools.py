@@ -1626,6 +1626,152 @@ def test_gh_open_pr_runs_fix_then_check_and_commits_fixup(
     assert f"refs/heads/{ws.branch}" in refs.stdout.splitlines()
 
 
+def test_gh_open_pr_refuses_dirty_worktree_before_fix(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pre-existing uncommitted edit MUST cause gh_open_pr (and gh_push_branch)
+    to refuse BEFORE `bun run fix` runs — otherwise `git add -A` after fix
+    would silently fold the unrelated edit into the `style: bun run fix`
+    commit and ship it in the PR."""
+    import os
+    import subprocess
+
+    bare = tmp_path / "upstream.git"
+    bare.mkdir()
+    subprocess.run(["git", "init", "--bare", "--initial-branch=main", str(bare)], check=True, capture_output=True)
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    env = os.environ | {
+        "GIT_AUTHOR_NAME": "robomp-bot",
+        "GIT_AUTHOR_EMAIL": "robomp-bot@example.invalid",
+        "GIT_COMMITTER_NAME": "robomp-bot",
+        "GIT_COMMITTER_EMAIL": "robomp-bot@example.invalid",
+    }
+    subprocess.run(["git", "init", "--initial-branch=main", str(seed)], check=True, capture_output=True)
+    (seed / "README.md").write_text("init\n")
+    for cmd in (
+        ["git", "-C", str(seed), "add", "."],
+        [
+            "git", "-C", str(seed),
+            "-c", "user.email=robomp-bot@example.invalid",
+            "-c", "user.name=robomp-bot",
+            "commit", "-m", "init",
+        ],
+        ["git", "-C", str(seed), "remote", "add", "origin", str(bare)],
+        ["git", "-C", str(seed), "push", "origin", "main"],
+    ):
+        subprocess.run(cmd, check=True, capture_output=True, env=env)
+
+    from robomp.sandbox import SandboxManager
+
+    mgr = SandboxManager(tmp_path / "workspaces")
+    ws = mgr.ensure_workspace(
+        repo="octo/widget",
+        number=42,
+        title="dirty before fix",
+        clone_url=str(bare),
+        default_branch="main",
+        author_name="robomp-bot",
+        author_email="robomp-bot@example.invalid",
+    )
+
+    # `bun run fix` is a no-op; `bun check` would also pass. The bug being
+    # tested is the staging order, not the formatter's behavior.
+    fakebin = tmp_path / "fakebin"
+    fakebin.mkdir()
+    fake_bun = fakebin / "bun"
+    fake_bun.write_text("#!/bin/sh\nexit 0\n")
+    fake_bun.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fakebin}{os.pathsep}{os.environ['PATH']}")
+
+    # Commit a clean package.json + tracked source; then leave an UNRELATED
+    # uncommitted edit sitting in the worktree (the kind of thing the agent
+    # forgot to commit).
+    (ws.repo_dir / "package.json").write_text(
+        json.dumps({"scripts": {"fix": "...", "check": "..."}}) + "\n",
+        encoding="utf-8",
+    )
+    (ws.repo_dir / "src.txt").write_text("clean\n")
+    subprocess.run(
+        ["git", "-C", str(ws.repo_dir), "add", "package.json", "src.txt"],
+        check=True, capture_output=True,
+    )
+    subprocess.run(
+        [
+            "git", "-C", str(ws.repo_dir),
+            "-c", "user.email=robomp-bot@example.invalid",
+            "-c", "user.name=robomp-bot",
+            "commit", "-m", "feat: committed work",
+        ],
+        check=True, capture_output=True, env=env,
+    )
+    head_before = subprocess.run(
+        ["git", "-C", str(ws.repo_dir), "rev-parse", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    # Now plant the stowaway edit that the agent forgot.
+    (ws.repo_dir / "src.txt").write_text("STOWAWAY uncommitted edit\n")
+
+    github = GitHubClient("tok", transport=httpx.MockTransport(lambda r: httpx.Response(500)))
+    loop, thread = _make_loop_in_background()
+    try:
+        bindings = ToolBindings(
+            db=db,
+            github=github,
+            git_transport=LocalGitTransport(token=None),
+            repo=_stub_repo(),
+            issue=IssueInfo(
+                repo="octo/widget", number=42, title="t", body="",
+                state="open", author="alice", labels=(), is_pull_request=False,
+            ),
+            workspace=ws,
+            loop=loop,
+            author_name="robomp-bot",
+            author_email="robomp-bot@example.invalid",
+        )
+        db.upsert_issue(
+            key=bindings.issue_key, repo="octo/widget", number=42,
+            state="reproducing", branch=ws.branch, session_dir=str(ws.session_dir),
+        )
+        push_tool = next(x for x in build(bindings) if x.name == "gh_push_branch")
+        with pytest.raises(RpcCommandError) as exc:
+            push_tool.execute({}, _ctx())
+        assert "dirty worktree" in str(exc.value).lower()
+
+        pr_tool = next(x for x in build(bindings) if x.name == "gh_open_pr")
+        body = "## Repro\nr\n\n## Cause\nc\n\n## Fix\nf\n\n## Verification\nv\n\nFixes #42\n"
+        with pytest.raises(RpcCommandError) as exc2:
+            pr_tool.execute({"title": "fix: x", "body": body}, _ctx())
+        assert "dirty worktree" in str(exc2.value).lower()
+    finally:
+        _stop_loop(loop, thread)
+
+    # HEAD is unchanged: the unrelated edit was NEVER committed.
+    head_after = subprocess.run(
+        ["git", "-C", str(ws.repo_dir), "rev-parse", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert head_after == head_before
+    # The stowaway edit is still sitting uncommitted in the worktree.
+    status = subprocess.run(
+        ["git", "-C", str(ws.repo_dir), "status", "--porcelain"],
+        capture_output=True, text=True, check=True,
+    )
+    assert "src.txt" in status.stdout
+    # No commit named "style: bun run fix" exists.
+    log = subprocess.run(
+        ["git", "-C", str(ws.repo_dir), "log", "--format=%s"],
+        capture_output=True, text=True, check=True,
+    )
+    assert "style: bun run fix" not in log.stdout
+    # Origin's farm/* branch was never created — push refused before reaching the network.
+    refs = subprocess.run(
+        ["git", "-C", str(bare), "for-each-ref", "--format=%(refname)"],
+        capture_output=True, text=True, check=True,
+    )
+    assert not any(r.startswith("refs/heads/farm/") for r in refs.stdout.splitlines())
+
+
 def test_gh_open_pr_skips_fix_when_no_script(db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """No `scripts.fix` entry → fix stage is a no-op even if `scripts.check` exists."""
     import os
